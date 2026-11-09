@@ -62,6 +62,12 @@ extension Config {
         static let `default` = false
         public static let key: String = "dev.ensan.inputmethod.azooKeyMac.preference.optionDirectFullWidthInput"
     }
+    /// ローマ字入力中に打った英単語を英字のまま入力する設定（日英混在入力）
+    public struct MixedLanguageRomanInput: BoolConfigItem {
+        public init() {}
+        static let `default` = false
+        public static let key: String = "dev.ensan.inputmethod.azooKeyMac.preference.mixedLanguageRomanInput"
+    }
     /// AI変換時にコンテキストを含めるかどうか
     public struct IncludeContextInAITransform: BoolConfigItem {
         public init() {}

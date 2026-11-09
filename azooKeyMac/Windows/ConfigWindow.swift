@@ -5,6 +5,7 @@ import SwiftUI
 struct ConfigWindow: View {
     @ConfigState private var liveConversion = Config.LiveConversion()
     @ConfigState private var inputStyle = Config.InputStyle()
+    @ConfigState private var mixedLanguageRomanInput = Config.MixedLanguageRomanInput()
     @ConfigState private var typeBackSlash = Config.TypeBackSlash()
     @ConfigState private var punctuationStyle = Config.PunctuationStyle()
     @ConfigState private var typeHalfSpace = Config.TypeHalfSpace()
@@ -27,6 +28,7 @@ struct ConfigWindow: View {
     @State private var selectedTab: Tab = .basic
     @State private var zenzaiProfileHelpPopover = false
     @State private var zenzaiInferenceLimitHelpPopover = false
+    @State private var mixedLanguageRomanInputHelpPopover = false
     @State private var openAiApiKeyPopover = false
     @State private var connectionTestInProgress = false
     @State private var showingRomajiTableEditor = false
@@ -587,6 +589,20 @@ struct ConfigWindow: View {
                     } label: {
                         Text("カスタム入力テーブル")
                     }
+                }
+                HStack {
+                    Toggle("日英混在入力（ベータ版）", isOn: $mixedLanguageRomanInput)
+                        .disabled(inputStyle.value != .default)
+                    helpButton(
+                        helpContent: """
+                    ローマ字入力中に打った英単語を、英字のまま入力します。
+                    「kyouhagoogledekensaku」→「きょうはgoogleでけんさく」のように、日本語と英語を切り替えずに打てます。
+                    英単語かどうかは、同梱の辞書とmacOSのスペルチェッカーで調べます。
+                    製品名やサービス名は、変換候補に正しい表記も出します（iphone → iPhone）。
+                    入力方式が「デフォルト」のときに使えます。
+                    """,
+                        isPresented: $mixedLanguageRomanInputHelpPopover
+                    )
                 }
             } header: {
                 Label("入力方式", systemImage: "keyboard")

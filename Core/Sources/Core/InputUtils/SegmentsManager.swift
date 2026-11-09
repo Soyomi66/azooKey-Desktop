@@ -20,13 +20,24 @@ public final class SegmentsManager {
     /// テストなどの設定注入のための型。外部には設定を露出させない。
     public struct Context {
         public init() {}
-        public init(useZenzai: Bool, resourcesDirectoryURL: URL? = nil) {
+        public init(
+            useZenzai: Bool,
+            resourcesDirectoryURL: URL? = nil,
+            mixedLanguageRomanInput: Bool? = nil,
+            englishWordChecker: (any EnglishWordChecking)? = nil
+        ) {
             self.useZenzai = useZenzai
             self.resourcesDirectoryURL = resourcesDirectoryURL
+            self.mixedLanguageRomanInput = mixedLanguageRomanInput
+            self.englishWordChecker = englishWordChecker
         }
 
         var useZenzai: Bool = true
         var resourcesDirectoryURL: URL?
+        /// 日英混在入力を使うか。`nil`なら設定（`Config.MixedLanguageRomanInput`）に従う
+        var mixedLanguageRomanInput: Bool?
+        /// 日英混在入力で英単語を調べる。`nil`ならOSのスペルチェッカーを使う
+        var englishWordChecker: (any EnglishWordChecking)?
     }
 
     public weak var delegate: (any SegmentManagerDelegate)?
@@ -56,8 +67,20 @@ public final class SegmentsManager {
     private var composingText: ComposingText = ComposingText()
     private var lastInputStyle: InputStyle = .direct
 
+    /// 日英混在入力で、英単語かどうかと固有名詞の表記を調べる
+    @MainActor private lazy var englishWordChecker: any EnglishWordChecking = self.context.englishWordChecker ?? SystemEnglishWordChecker()
+    /// 日英混在入力で英単語を見分ける
+    @MainActor private lazy var mixedLanguageSegmenter = MixedLanguageSegmenter(englishWordChecker: self.englishWordChecker)
+    /// 日英混在入力で前回判定した英字の区間の始まり（`composingText.input`の位置）
+    private var mixedLanguageRunStartIndex: Int?
+    /// 入力中の文字列の前が英文か。左文脈の取得はクライアントへの問い合わせになるので、1回の入力の間は覚えておく
+    private var mixedLanguagePrecededByEnglish: Bool?
+
     private var liveConversionEnabled: Bool {
         Config.LiveConversion().value
+    }
+    private var mixedLanguageRomanInputEnabled: Bool {
+        self.context.mixedLanguageRomanInput ?? Config.MixedLanguageRomanInput().value
     }
     private var zenzaiPersonalizationLevel: Config.ZenzaiPersonalizationLevel.Value {
         Config.ZenzaiPersonalizationLevel().value
@@ -286,6 +309,7 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.resetMixedLanguageState()
     }
 
     @MainActor
@@ -302,6 +326,7 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.resetMixedLanguageState()
     }
 
     @MainActor
@@ -317,6 +342,7 @@ public final class SegmentsManager {
         self.backspaceAdjustedPredictionCandidate = nil
         self.backspaceTypoCorrectionLock = nil
         self.lastInputStyle = .direct
+        self.resetMixedLanguageState()
     }
 
     /// 変換キーを押したタイミングで入力の区切りを示す
@@ -326,8 +352,11 @@ public final class SegmentsManager {
             // すでに末尾がcompositionSeparatorの場合は何もしない
             return
         }
+        // 日英混在入力: 区切る前に、末尾の子音も英字として判定し直す（`meeting`の`g`など）
+        self.applyMixedLanguageInput(inputStyle: inputStyle, isFinal: true)
         self.lastInputStyle = inputStyle
         self.composingText.insertAtCursorPosition([.init(piece: .compositionSeparator, inputStyle: inputStyle)])
+        self.mixedLanguageRunStartIndex = nil
         self.lastOperation = .insert
         if !skipUpdate {
             self.updateRawCandidate()
@@ -338,6 +367,7 @@ public final class SegmentsManager {
     public func insertAtCursorPosition(_ string: String, inputStyle: InputStyle) {
         self.lastInputStyle = inputStyle
         self.composingText.insertAtCursorPosition(string, inputStyle: inputStyle)
+        self.applyMixedLanguageInput(inputStyle: inputStyle, isFinal: false)
         self.lastOperation = .insert
         // ライブ変換がオフの場合は変換候補ウィンドウを出したい
         self.shouldShowCandidateWindow = !self.liveConversionEnabled
@@ -348,6 +378,7 @@ public final class SegmentsManager {
     public func insertAtCursorPosition(pieces: [InputPiece], inputStyle: InputStyle) {
         self.lastInputStyle = inputStyle
         self.composingText.insertAtCursorPosition(pieces.map { .init(piece: $0, inputStyle: inputStyle) })
+        self.applyMixedLanguageInput(inputStyle: inputStyle, isFinal: false)
         self.lastOperation = .insert
         // ライブ変換がオフの場合は変換候補ウィンドウを出したい
         self.shouldShowCandidateWindow = !self.liveConversionEnabled
@@ -499,6 +530,49 @@ public final class SegmentsManager {
         self.composingText.isEmpty
     }
 
+    /// 日英混在入力: 末尾に続けて打った英字のうち、英単語と判定した部分をダイレクト入力に切り替える
+    /// - Parameters:
+    ///   - inputStyle: 今打った文字の入力方式。既定のローマ字入力のときだけ判定する
+    ///   - isFinal: 確定する直前（または変換のために区切る直前）の判定か
+    /// - Returns: `composingText`を書き換えたか
+    @MainActor @discardableResult
+    private func applyMixedLanguageInput(inputStyle: InputStyle, isFinal: Bool) -> Bool {
+        guard self.mixedLanguageRomanInputEnabled, MixedLanguageComposer.supports(inputStyle) else {
+            self.mixedLanguageRunStartIndex = nil
+            return false
+        }
+        let result = MixedLanguageComposer.apply(
+            to: self.composingText,
+            runStartIndex: self.mixedLanguageRunStartIndex,
+            segmenter: self.mixedLanguageSegmenter,
+            isFinal: isFinal,
+            romanInputStyle: inputStyle,
+            precededByEnglish: self.isMixedLanguagePrecededByEnglish()
+        )
+        self.mixedLanguageRunStartIndex = result.runStartIndex
+        if result.changed {
+            self.composingText = result.composingText
+        }
+        return result.changed
+    }
+
+    /// 入力中の文字列の前が英文（`I want `など）か
+    @MainActor
+    private func isMixedLanguagePrecededByEnglish() -> Bool {
+        if let cached = self.mixedLanguagePrecededByEnglish {
+            return cached
+        }
+        let leftSideContext = self.getCleanLeftSideContext(maxCount: ContextLength.conversion) ?? ""
+        let result = MixedLanguageComposer.isEnglishSentenceContext(leftSideContext)
+        self.mixedLanguagePrecededByEnglish = result
+        return result
+    }
+
+    private func resetMixedLanguageState() {
+        self.mixedLanguageRunStartIndex = nil
+        self.mixedLanguagePrecededByEnglish = nil
+    }
+
     public func getCleanLeftSideContext(maxCount: Int) -> String? {
         self.delegate?.getLeftSideContext(maxCount: maxCount).map {
             var last = $0.split(separator: "\n", omittingEmptySubsequences: false).last ?? $0[...]
@@ -595,7 +669,16 @@ public final class SegmentsManager {
                 )
             )
         }
-        self.rawCandidates = result
+        self.rawCandidates = self.adjustingMixedLanguageCandidates(result)
+    }
+
+    /// 日英混在入力で、変換候補を整える（`MixedLanguageComposer.adjustingCandidates`）
+    @MainActor
+    private func adjustingMixedLanguageCandidates(_ result: ConversionResult) -> ConversionResult {
+        guard self.mixedLanguageRomanInputEnabled else {
+            return result
+        }
+        return MixedLanguageComposer.adjustingCandidates(result, composingText: self.composingText, checker: self.englishWordChecker)
     }
 
     @MainActor public func update(requestRichCandidates: Bool) {
@@ -608,6 +691,7 @@ public final class SegmentsManager {
         self.withConverter { $0.setCompletedData(candidate) }
         self.withConverter { $0.updateLearningData(candidate) }
         self.composingText.prefixComplete(composingCount: candidate.composingCount)
+        self.resetMixedLanguageState()
 
         if !self.composingText.isEmpty {
             // カーソルを右端に移動する
@@ -863,6 +947,11 @@ public final class SegmentsManager {
 
     @MainActor
     public func commitMarkedText(inputState: InputState) -> String {
+        // 日英混在入力: 確定する前に、末尾の子音も英字として判定し直す（`meeting`の`g`など）
+        if inputState == .composing, self.applyMixedLanguageInput(inputStyle: self.lastInputStyle, isFinal: true) {
+            // ライブ変換の結果を、書き換えた入力で作り直す
+            self.updateRawCandidate()
+        }
         let markedText = self.getCurrentMarkedText(inputState: inputState)
         let text = markedText.reduce(into: "") {$0.append(contentsOf: $1.content)}
         if let candidate = self.candidates?.first(where: {$0.text == text}) {
@@ -984,6 +1073,7 @@ public final class SegmentsManager {
         guard self.withConverter({ $0.acceptPredictionCandidate(candidate, composingText: &self.composingText) }) else {
             return
         }
+        self.mixedLanguageRunStartIndex = nil
         self.lastInputStyle = .direct
         self.lastOperation = .insert
         self.shouldShowCandidateWindow = !self.liveConversionEnabled
